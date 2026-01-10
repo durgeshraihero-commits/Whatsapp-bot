@@ -1,7 +1,10 @@
 from fastapi import FastAPI, Request
-import requests, os
+import requests
+import os
 
 app = FastAPI()
+
+# ================= CONFIG =================
 
 VERIFY_TOKEN = "darkbox_verify"
 
@@ -9,7 +12,9 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 SEARCH_API_KEY = os.getenv("SEARCH_API_KEY")
 
-SEARCH_API = "https://relay-wzlz.onrender.com/api/search"
+GRAPH_API = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+
+# ================= STATE =================
 
 user_sessions = {}
 
@@ -38,28 +43,65 @@ MENU_MAP = {
     "8": "gst",
 }
 
-def send_whatsapp(to, text):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
+# ================= HELPERS =================
+
+def send_text(to: str, text: str):
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
+        "type": "text",
         "text": {"body": text},
     }
-    requests.post(url, headers=headers, json=payload, timeout=30)
+    requests.post(
+        GRAPH_API,
+        headers={
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+
+
+def send_template(to: str):
+    """
+    Uses the ONLY approved template you currently have: hello_world
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": "hello_world",
+            "language": {"code": "en_US"},
+        },
+    }
+    requests.post(
+        GRAPH_API,
+        headers={
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+
+
+# ================= ROUTES =================
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
 
 @app.get("/webhook")
-async def verify(request: Request):
-    p = request.query_params
+async def verify_webhook(request: Request):
+    params = request.query_params
     if (
-        p.get("hub.mode") == "subscribe"
-        and p.get("hub.verify_token") == VERIFY_TOKEN
+        params.get("hub.mode") == "subscribe"
+        and params.get("hub.verify_token") == VERIFY_TOKEN
     ):
-        return int(p.get("hub.challenge"))
+        return int(params.get("hub.challenge"))
     return "Invalid token"
 
 
@@ -73,65 +115,53 @@ async def webhook(request: Request):
         change = entry["changes"][0]
         value = change["value"]
 
+        # Ignore delivery/read statuses
         if "messages" not in value:
-            return {"ignored": True}
+            return {"status": "ignored"}
 
         msg = value["messages"][0]
         from_user = msg["from"]
-
-        if msg["type"] != "text":
-            return {"ignored": True}
-
         text = msg["text"]["body"].strip().lower()
-        print("FROM:", from_user, "TEXT:", text)
+
+        print(f"FROM: {from_user} TEXT: {text}")
 
         session = user_sessions.get(from_user)
 
-        # ACTIVATE
+        # ===== STEP 1: ACTIVATE BOT =====
         if text == "darkbox":
             user_sessions[from_user] = {"stage": "menu"}
-            send_whatsapp(from_user, MENU_TEXT)
-            return {"ok": True}
+            send_template(from_user)      # REQUIRED first reply
+            send_text(from_user, MENU_TEXT)
+            return {"status": "menu_sent"}
 
+        # Ignore messages before activation
         if not session:
-            return {"ignored": True}
+            return {"status": "not_activated"}
 
-        # MENU
+        # ===== STEP 2: MENU SELECTION =====
         if session["stage"] == "menu":
             if text in MENU_MAP:
                 user_sessions[from_user] = {
                     "stage": "awaiting_input",
                     "search_type": MENU_MAP[text],
                 }
-                send_whatsapp(from_user, "🔍 Send input to search:")
+                send_text(from_user, "🔍 Send input to search:")
             else:
-                send_whatsapp(from_user, "❌ Send number 1–8")
-            return {"ok": True}
+                send_text(from_user, "❌ Invalid choice. Reply 1–8.")
+            return {"status": "menu_handled"}
 
-        # SEARCH
+        # ===== STEP 3: INPUT =====
         if session["stage"] == "awaiting_input":
-            res = requests.post(
-                SEARCH_API,
-                headers={
-                    "X-API-Key": SEARCH_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "search_type": session["search_type"],
-                    "query": text,
-                },
-                timeout=60,
-            )
+            search_type = session["search_type"]
 
-            if res.status_code == 200:
-                result = res.json().get("result", "No data found")
-            else:
-                result = "❌ Error fetching data"
+            # Placeholder response (you can plug your API here)
+            result = f"✅ Search received\nType: {search_type}\nQuery: {text}"
 
-            send_whatsapp(from_user, str(result))
+            send_text(from_user, result)
             user_sessions.pop(from_user, None)
+            return {"status": "search_done"}
 
     except Exception as e:
         print("ERROR:", e)
 
-    return {"status": "done"}
+    return {"status": "ok"}
