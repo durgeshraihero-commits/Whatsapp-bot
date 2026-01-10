@@ -1,16 +1,25 @@
 from fastapi import FastAPI, Request
-import requests, os
+from fastapi.responses import PlainTextResponse
+import requests
+import os
 
 app = FastAPI()
 
+# ================= CONFIG =================
+
 VERIFY_TOKEN = "darkbox_verify"
+
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 SEARCH_API = "https://relay-wzlz.onrender.com/api/search"
 SEARCH_API_KEY = os.getenv("SEARCH_API_KEY")
 
+# ================= SESSION STORE =================
+
 user_sessions = {}
+
+# ================= MENU =================
 
 MENU_TEXT = """🔥 DARKBOX MENU 🔥
 
@@ -37,50 +46,71 @@ MENU_MAP = {
     "8": "gst",
 }
 
-def send_whatsapp(to, text):
-    requests.post(
-        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-        headers={
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "messaging_product": "whatsapp",
-            "to": to,
-            "text": {"body": text},
-        },
-        timeout=30,
-    )
+# ================= WHATSAPP SEND =================
+
+def send_whatsapp(to: str, text: str):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "text": {"body": text},
+    }
+
+    requests.post(url, headers=headers, json=payload, timeout=30)
+
+# ================= WEBHOOK VERIFY =================
 
 @app.get("/webhook")
-async def verify(request: Request):
-    p = request.query_params
-    if p.get("hub.verify_token") == VERIFY_TOKEN:
-        return int(p.get("hub.challenge"))
-    return "Invalid"
+async def verify_webhook(request: Request):
+    params = request.query_params
+
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return PlainTextResponse(challenge)
+
+    return PlainTextResponse("Invalid token", status_code=403)
+
+# ================= WEBHOOK RECEIVE =================
 
 @app.post("/webhook")
-async def webhook(request: Request):
+async def receive_message(request: Request):
     data = await request.json()
 
     try:
-        msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
+        entry = data.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+        messages = value.get("messages")
+
+        if not messages:
+            return {"status": "no_message"}
+
+        msg = messages[0]
         from_user = msg["from"]
         text = msg["text"]["body"].strip().lower()
 
         session = user_sessions.get(from_user)
 
-        # STEP 1: ACTIVATE BOT
+        # 🔑 STEP 1: ACTIVATE BOT
         if text == "darkbox":
             user_sessions[from_user] = {"stage": "menu"}
             send_whatsapp(from_user, MENU_TEXT)
-            return {"ok": True}
+            return {"status": "menu_sent"}
 
-        # IGNORE if bot not activated
+        # ❌ Ignore if not activated
         if not session:
-            return {"ignored": True}
+            return {"status": "ignored"}
 
-        # STEP 2: MENU SELECTION
+        # 🔢 STEP 2: MENU SELECTION
         if session["stage"] == "menu":
             if text in MENU_MAP:
                 user_sessions[from_user] = {
@@ -89,10 +119,10 @@ async def webhook(request: Request):
                 }
                 send_whatsapp(from_user, "🔍 Send input to search:")
             else:
-                send_whatsapp(from_user, "❌ Invalid choice. Send 1–8.")
-            return {"ok": True}
+                send_whatsapp(from_user, "❌ Invalid choice. Reply 1–8.")
+            return {"status": "menu_handled"}
 
-        # STEP 3: SEARCH INPUT
+        # 🔍 STEP 3: SEARCH
         if session["stage"] == "awaiting_input":
             search_type = session["search_type"]
 
@@ -102,7 +132,10 @@ async def webhook(request: Request):
                     "X-API-Key": SEARCH_API_KEY,
                     "Content-Type": "application/json",
                 },
-                json={"search_type": search_type, "query": text},
+                json={
+                    "search_type": search_type,
+                    "query": text,
+                },
                 timeout=60,
             )
 
@@ -111,10 +144,12 @@ async def webhook(request: Request):
             else:
                 result = "❌ Error fetching data"
 
-            send_whatsapp(from_user, result)
+            send_whatsapp(from_user, str(result))
             user_sessions.pop(from_user, None)
 
-    except Exception as e:
-        print("Error:", e)
+            return {"status": "search_done"}
 
-    return {"status": "done"}
+    except Exception as e:
+        print("Webhook error:", e)
+
+    return {"status": "ok"}
