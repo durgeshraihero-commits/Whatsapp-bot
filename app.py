@@ -21,56 +21,99 @@ client = MongoClient(os.getenv("MONGODB_URI"))
 db = client[os.getenv("MONGODB_DBNAME")]
 
 users = db.whatsapp_users
-searches = db.whatsapp_searches
 payments = db.whatsapp_payments
+searches = db.whatsapp_searches
 
 # ================= HELPERS =================
-def send_text(to, text):
+def send_request(payload):
     r = requests.post(
         GRAPH_URL,
         headers={
             "Authorization": f"Bearer {WHATSAPP_TOKEN}",
             "Content-Type": "application/json"
         },
-        json={
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": text}
-        },
+        json=payload,
         timeout=30
     )
-    print("SEND:", r.status_code, r.text)
+    print(r.status_code, r.text)
 
 
-def forward_image_to_admin(media_id, caption):
-    meta_url = f"https://graph.facebook.com/v19.0/{media_id}"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+def send_text(to, text):
+    send_request({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text}
+    })
 
-    media = requests.get(meta_url, headers=headers).json()
-    image_url = media.get("url")
 
-    if not image_url:
-        print("❌ Failed to fetch media URL")
-        return
-
-    requests.post(
-        GRAPH_URL,
-        headers=headers,
-        json={
-            "messaging_product": "whatsapp",
-            "to": ADMIN_NUMBER,
-            "type": "image",
-            "image": {
-                "link": image_url,
-                "caption": caption
+def send_main_menu(to, credits):
+    send_request({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {
+                "text": f"🔐 *DARKBOX*\n\nCredits: {credits}\nChoose an option:"
+            },
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": "SEARCH_MENU", "title": "🔍 Search"}},
+                    {"type": "reply", "reply": {"id": "BUY_MENU", "title": "💳 Buy Credits"}},
+                    {"type": "reply", "reply": {"id": "MY_CREDITS", "title": "📊 My Credits"}},
+                    {"type": "reply", "reply": {"id": "EXIT", "title": "🚪 Exit"}}
+                ]
             }
         }
-    )
+    })
+
+
+def send_search_menu(to):
+    send_request({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": "Select search type:"},
+            "action": {
+                "button": "Choose",
+                "sections": [{
+                    "title": "OSINT Tools",
+                    "rows": [
+                        {"id": "SEARCH_PHONE", "title": "📞 Phone Number"},
+                        {"id": "SEARCH_AADHAR", "title": "🆔 Aadhaar"},
+                        {"id": "SEARCH_VEHICLE", "title": "🚗 Vehicle"},
+                        {"id": "SEARCH_FAMILY", "title": "👨‍👩‍👦 Family"}
+                    ]
+                }]
+            }
+        }
+    })
+
+
+def send_buy_menu(to):
+    send_request({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": "💳 Choose a plan:"},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": "PAY_100", "title": "₹100 – 5 Searches"}},
+                    {"type": "reply", "reply": {"id": "PAY_200", "title": "₹200 – 15 Searches"}},
+                    {"type": "reply", "reply": {"id": "PAY_500", "title": "₹500 – Unlimited"}}
+                ]
+            }
+        }
+    })
 
 
 def is_session_active(user):
-    if not user.get("darkbox_active"):
+    if not user.get("active"):
         return False
     last = user.get("last_active")
     if not last:
@@ -85,17 +128,12 @@ def call_search_api(search_type, query):
             "X-API-Key": SEARCH_API_KEY,
             "Content-Type": "application/json"
         },
-        json={
-            "search_type": search_type,
-            "query": query
-        },
+        json={"search_type": search_type, "query": query},
         timeout=60
     )
-
     if r.status_code == 200:
         return r.json().get("result", "No data found")
     return "❌ Search API error"
-
 
 # ================= WEBHOOK VERIFY =================
 @app.get("/webhook")
@@ -105,175 +143,119 @@ async def verify(request: Request):
         return int(p.get("hub.challenge"))
     return "Invalid token"
 
-
 # ================= WEBHOOK RECEIVE =================
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
-    print("RAW PAYLOAD:", data)
+    print("RAW:", data)
 
     try:
         change = data["entry"][0]["changes"][0]["value"]
-
-        # Ignore status callbacks
         if "statuses" in change:
             return {"ok": True}
 
         msg = change["messages"][0]
         wa_id = msg["from"]
-
-        # SAFE name extraction (CRITICAL FIX)
-        name = "User"
-        try:
-            name = change.get("contacts", [{}])[0].get("profile", {}).get("name", "User")
-        except:
-            pass
-
         now = datetime.datetime.utcnow()
-        print("FROM:", wa_id, "NAME:", name)
 
         user = users.find_one({"wa_id": wa_id})
         if not user:
             users.insert_one({
                 "wa_id": wa_id,
-                "name": name,
                 "credits": 2,
-                "darkbox_active": False,
-                "last_active": None,
-                "created_at": now
+                "active": True,
+                "last_active": now
             })
             user = users.find_one({"wa_id": wa_id})
 
-        # ================= TEXT =================
-        if msg["type"] == "text":
-            text = msg["text"]["body"].strip().lower()
-            print("TEXT:", text)
+        users.update_one({"wa_id": wa_id}, {"$set": {"last_active": now}})
 
-            # EXIT
-            if text == "exit":
+        # ================= INTERACTIVE =================
+        if msg["type"] == "interactive":
+            reply_id = (
+                msg["interactive"].get("button_reply", {}) or
+                msg["interactive"].get("list_reply", {})
+            ).get("id")
+
+            if reply_id == "SEARCH_MENU":
+                send_search_menu(wa_id)
+
+            elif reply_id == "BUY_MENU":
+                send_buy_menu(wa_id)
+
+            elif reply_id == "MY_CREDITS":
+                send_text(wa_id, f"📊 Credits remaining: {user['credits']}")
+
+            elif reply_id == "EXIT":
+                users.update_one({"wa_id": wa_id}, {"$set": {"active": False}})
+                send_text(wa_id, "🚪 Exited Darkbox.")
+
+            elif reply_id.startswith("SEARCH_"):
                 users.update_one(
                     {"wa_id": wa_id},
-                    {"$set": {"darkbox_active": False}}
+                    {"$set": {"pending_search": reply_id}}
                 )
-                send_text(wa_id, "🚪 You exited Darkbox. Send *darkbox* to start again.")
-                return {"ok": True}
+                send_text(wa_id, "🔢 Send the number to search")
 
-            # ACTIVATE DARKBOX (ALWAYS ALLOWED)
-            if text == "darkbox":
-                users.update_one(
-                    {"wa_id": wa_id},
-                    {"$set": {"darkbox_active": True, "last_active": now}}
-                )
-                user = users.find_one({"wa_id": wa_id})
-
-                send_text(
-                    wa_id,
-                    f"""👋 Hi {user['name']}
-
-Welcome to *DARKBOX* 🔐
-A private OSINT intelligence bot.
-
-💳 Credits: {user['credits']}
-
-Commands:
-• phone <number>
-• aadhar <number>
-• family <number>
-• vehicle <number>
-• buy
-• exit
-"""
-                )
-                return {"ok": True}
-
-            # BLOCK IF SESSION NOT ACTIVE
-            if not is_session_active(user):
-                print("⛔ Session inactive, ignoring")
-                return {"ok": True}
-
-            # UPDATE LAST ACTIVE
-            users.update_one(
-                {"wa_id": wa_id},
-                {"$set": {"last_active": now}}
-            )
-
-            # BUY
-            if text == "buy":
-                send_text(
-                    wa_id,
-                    """💳 PLANS
-
-₹100 → 5 searches
-₹200 → 15 searches
-₹500 → Unlimited (7 days)
-
-Reply:
-PAY 100
-PAY 200
-PAY 500"""
-                )
-                return {"ok": True}
-
-            if text.startswith("pay"):
-                amount = text.split()[-1]
+            elif reply_id.startswith("PAY_"):
+                amount = reply_id.split("_")[1]
                 payments.insert_one({
                     "wa_id": wa_id,
                     "amount": amount,
                     "status": "pending",
-                    "created_at": now
+                    "time": now
                 })
                 send_text(
                     wa_id,
-                    f"""💰 Payment Details
-
-UPI: darkbox@upi
-Amount: ₹{amount}
-
-📸 Send payment screenshot."""
+                    f"💰 Payment Details\n\nUPI: darkbox@upi\nAmount: ₹{amount}\n\n📸 Send payment screenshot"
                 )
-                return {"ok": True}
 
-            # SEARCH COMMANDS
-            for cmd in ["phone", "aadhar", "family", "vehicle"]:
-                if text.startswith(cmd):
-                    user = users.find_one({"wa_id": wa_id})
-                    if user["credits"] <= 0:
-                        send_text(wa_id, "❌ No credits left. Buy a plan.")
-                        return {"ok": True}
-
-                    query = text.split()[-1]
-                    users.update_one(
-                        {"wa_id": wa_id},
-                        {"$inc": {"credits": -1}}
-                    )
-
-                    result = call_search_api(cmd, query)
-
-                    searches.insert_one({
-                        "wa_id": wa_id,
-                        "type": cmd,
-                        "query": query,
-                        "result": result[:500],
-                        "time": now
-                    })
-
-                    send_text(wa_id, result)
-                    return {"ok": True}
-
-        # ================= IMAGE =================
-        if msg["type"] == "image":
-            if not is_session_active(user):
-                return {"ok": True}
-
-            media_id = msg["image"]["id"]
-            forward_image_to_admin(
-                media_id,
-                f"🧾 Payment Screenshot\nUser: {wa_id}\nReply: APPROVE {wa_id}"
-            )
-            send_text(wa_id, "⏳ Payment received. Under review.")
             return {"ok": True}
 
+        # ================= TEXT INPUT (NUMBER) =================
+        if msg["type"] == "text":
+            if not is_session_active(user):
+                send_main_menu(wa_id, user["credits"])
+                return {"ok": True}
+
+            pending = user.get("pending_search")
+            if not pending:
+                send_main_menu(wa_id, user["credits"])
+                return {"ok": True}
+
+            if user["credits"] <= 0:
+                send_text(wa_id, "❌ No credits left")
+                return {"ok": True}
+
+            query = msg["text"]["body"].strip()
+
+            search_map = {
+                "SEARCH_PHONE": "phone",
+                "SEARCH_AADHAR": "aadhar",
+                "SEARCH_VEHICLE": "vehicle",
+                "SEARCH_FAMILY": "family"
+            }
+
+            search_type = search_map.get(pending)
+            result = call_search_api(search_type, query)
+
+            users.update_one(
+                {"wa_id": wa_id},
+                {"$inc": {"credits": -1}, "$unset": {"pending_search": ""}}
+            )
+
+            searches.insert_one({
+                "wa_id": wa_id,
+                "type": search_type,
+                "query": query,
+                "result": result[:500],
+                "time": now
+            })
+
+            send_text(wa_id, result)
+            send_main_menu(wa_id, user["credits"] - 1)
+
     except Exception as e:
-        print("🔥 ERROR:", e)
+        print("ERROR:", e)
 
     return {"ok": True}
