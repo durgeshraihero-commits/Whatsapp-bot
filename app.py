@@ -35,7 +35,7 @@ def send_request(payload):
         json=payload,
         timeout=30
     )
-    print(r.status_code, r.text)
+    print("SEND:", r.status_code, r.text)
 
 
 def send_text(to, text):
@@ -47,6 +47,7 @@ def send_text(to, text):
     })
 
 
+# ================= MENUS =================
 def send_main_menu(to, credits):
     send_request({
         "messaging_product": "whatsapp",
@@ -61,8 +62,7 @@ def send_main_menu(to, credits):
                 "buttons": [
                     {"type": "reply", "reply": {"id": "SEARCH_MENU", "title": "🔍 Search"}},
                     {"type": "reply", "reply": {"id": "BUY_MENU", "title": "💳 Buy Credits"}},
-                    {"type": "reply", "reply": {"id": "MY_CREDITS", "title": "📊 My Credits"}},
-                    {"type": "reply", "reply": {"id": "EXIT", "title": "🚪 Exit"}}
+                    {"type": "reply", "reply": {"id": "MORE_MENU", "title": "☰ More"}}
                 ]
             }
         }
@@ -80,7 +80,7 @@ def send_search_menu(to):
             "action": {
                 "button": "Choose",
                 "sections": [{
-                    "title": "OSINT Tools",
+                    "title": "OSINT Searches",
                     "rows": [
                         {"id": "SEARCH_PHONE", "title": "📞 Phone Number"},
                         {"id": "SEARCH_AADHAR", "title": "🆔 Aadhaar"},
@@ -112,6 +112,29 @@ def send_buy_menu(to):
     })
 
 
+def send_more_menu(to):
+    send_request({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": "More options:"},
+            "action": {
+                "button": "Open",
+                "sections": [{
+                    "title": "Account",
+                    "rows": [
+                        {"id": "MY_CREDITS", "title": "📊 My Credits"},
+                        {"id": "EXIT", "title": "🚪 Exit"}
+                    ]
+                }]
+            }
+        }
+    })
+
+
+# ================= LOGIC =================
 def is_session_active(user):
     if not user.get("active"):
         return False
@@ -135,6 +158,7 @@ def call_search_api(search_type, query):
         return r.json().get("result", "No data found")
     return "❌ Search API error"
 
+
 # ================= WEBHOOK VERIFY =================
 @app.get("/webhook")
 async def verify(request: Request):
@@ -142,6 +166,7 @@ async def verify(request: Request):
     if p.get("hub.verify_token") == VERIFY_TOKEN:
         return int(p.get("hub.challenge"))
     return "Invalid token"
+
 
 # ================= WEBHOOK RECEIVE =================
 @app.post("/webhook")
@@ -151,6 +176,7 @@ async def webhook(request: Request):
 
     try:
         change = data["entry"][0]["changes"][0]["value"]
+
         if "statuses" in change:
             return {"ok": True}
 
@@ -170,12 +196,57 @@ async def webhook(request: Request):
 
         users.update_one({"wa_id": wa_id}, {"$set": {"last_active": now}})
 
+        # ================= TEXT =================
+        if msg["type"] == "text":
+            text = msg["text"]["body"].strip().lower()
+
+            if text == "darkbox":
+                users.update_one(
+                    {"wa_id": wa_id},
+                    {"$set": {"active": True, "last_active": now}}
+                )
+                send_main_menu(wa_id, user["credits"])
+                return {"ok": True}
+
+            pending = user.get("pending_search")
+            if not pending:
+                send_main_menu(wa_id, user["credits"])
+                return {"ok": True}
+
+            if user["credits"] <= 0:
+                send_text(wa_id, "❌ No credits left. Buy a plan.")
+                return {"ok": True}
+
+            search_map = {
+                "SEARCH_PHONE": "phone",
+                "SEARCH_AADHAR": "aadhar",
+                "SEARCH_VEHICLE": "vehicle",
+                "SEARCH_FAMILY": "family"
+            }
+
+            result = call_search_api(search_map[pending], text)
+
+            users.update_one(
+                {"wa_id": wa_id},
+                {"$inc": {"credits": -1}, "$unset": {"pending_search": ""}}
+            )
+
+            searches.insert_one({
+                "wa_id": wa_id,
+                "type": search_map[pending],
+                "query": text,
+                "result": result[:500],
+                "time": now
+            })
+
+            send_text(wa_id, result)
+            send_main_menu(wa_id, user["credits"] - 1)
+            return {"ok": True}
+
         # ================= INTERACTIVE =================
         if msg["type"] == "interactive":
-            reply_id = (
-                msg["interactive"].get("button_reply", {}) or
-                msg["interactive"].get("list_reply", {})
-            ).get("id")
+            reply = msg["interactive"].get("button_reply") or msg["interactive"].get("list_reply")
+            reply_id = reply.get("id")
 
             if reply_id == "SEARCH_MENU":
                 send_search_menu(wa_id)
@@ -183,18 +254,18 @@ async def webhook(request: Request):
             elif reply_id == "BUY_MENU":
                 send_buy_menu(wa_id)
 
+            elif reply_id == "MORE_MENU":
+                send_more_menu(wa_id)
+
             elif reply_id == "MY_CREDITS":
                 send_text(wa_id, f"📊 Credits remaining: {user['credits']}")
 
             elif reply_id == "EXIT":
                 users.update_one({"wa_id": wa_id}, {"$set": {"active": False}})
-                send_text(wa_id, "🚪 Exited Darkbox.")
+                send_text(wa_id, "🚪 You exited Darkbox.")
 
             elif reply_id.startswith("SEARCH_"):
-                users.update_one(
-                    {"wa_id": wa_id},
-                    {"$set": {"pending_search": reply_id}}
-                )
+                users.update_one({"wa_id": wa_id}, {"$set": {"pending_search": reply_id}})
                 send_text(wa_id, "🔢 Send the number to search")
 
             elif reply_id.startswith("PAY_"):
@@ -211,49 +282,6 @@ async def webhook(request: Request):
                 )
 
             return {"ok": True}
-
-        # ================= TEXT INPUT (NUMBER) =================
-        if msg["type"] == "text":
-            if not is_session_active(user):
-                send_main_menu(wa_id, user["credits"])
-                return {"ok": True}
-
-            pending = user.get("pending_search")
-            if not pending:
-                send_main_menu(wa_id, user["credits"])
-                return {"ok": True}
-
-            if user["credits"] <= 0:
-                send_text(wa_id, "❌ No credits left")
-                return {"ok": True}
-
-            query = msg["text"]["body"].strip()
-
-            search_map = {
-                "SEARCH_PHONE": "phone",
-                "SEARCH_AADHAR": "aadhar",
-                "SEARCH_VEHICLE": "vehicle",
-                "SEARCH_FAMILY": "family"
-            }
-
-            search_type = search_map.get(pending)
-            result = call_search_api(search_type, query)
-
-            users.update_one(
-                {"wa_id": wa_id},
-                {"$inc": {"credits": -1}, "$unset": {"pending_search": ""}}
-            )
-
-            searches.insert_one({
-                "wa_id": wa_id,
-                "type": search_type,
-                "query": query,
-                "result": result[:500],
-                "time": now
-            })
-
-            send_text(wa_id, result)
-            send_main_menu(wa_id, user["credits"] - 1)
 
     except Exception as e:
         print("ERROR:", e)
